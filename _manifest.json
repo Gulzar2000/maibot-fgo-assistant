@@ -1,0 +1,70 @@
+{
+  "manifest_version": 2,
+  "id": "maibot-community.fgogacha",
+  "version": "1.4.0",
+  "name": "FGO小助手",
+  "description": "FGO 小助手：模拟抽卡、卡池与活动查询、素材来源、羁绊挖矿计算、扫码绑定及真实/模拟出率统计",
+  "author": {
+    "name": "kcn3388 (原作) / MaiBot Community (移植)",
+    "url": "https://github.com/kcn3388/fgogacha"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/Gulzar2000/maibot-fgo-assistant",
+    "homepage": "https://github.com/Gulzar2000/maibot-fgo-assistant",
+    "documentation": "https://github.com/Gulzar2000/maibot-fgo-assistant/blob/main/README.md",
+    "issues": "https://github.com/Gulzar2000/maibot-fgo-assistant/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "beautifulsoup4",
+      "version_spec": ">=4.9.0"
+    },
+    {
+      "type": "python_package",
+      "name": "Pillow",
+      "version_spec": ">=9.5.0"
+    },
+    {
+      "type": "python_package",
+      "name": "aiohttp",
+      "version_spec": ">=3.8.0"
+    },
+    {
+      "type": "python_package",
+      "name": "qrcode",
+      "version_spec": ">=8.2,<9"
+    },
+    {
+      "type": "python_package",
+      "name": "cryptography",
+      "version_spec": ">=46"
+    }
+  ],
+  "capabilities": [
+    "send.text",
+    "send.image",
+    "send.forward",
+    "send.hybrid",
+    "config.get",
+    "api.call",
+    "chat.get_stream_by_user_id",
+    "chat.get_stream_by_group_id"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}

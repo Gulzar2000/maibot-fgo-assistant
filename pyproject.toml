@@ -1,0 +1,12 @@
+[project]
+name = "maibot-fgo-assistant"
+version = "1.4.0"
+requires-python = ">=3.12"
+dependencies = [
+    "maibot-plugin-sdk>=2.12.0",
+    "beautifulsoup4>=4.9.0",
+    "Pillow>=9.5.0",
+    "aiohttp>=3.8.0",
+    "qrcode>=8.2,<9",
+    "cryptography>=46",
+]
