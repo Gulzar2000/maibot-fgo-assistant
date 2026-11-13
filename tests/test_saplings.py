@@ -14,7 +14,7 @@ from gacha.saplings import SaplingClient
 
 class SaplingExchangeTests(unittest.TestCase):
     def run_exchange(self, requested, *, ap=95, saplings=8, timeout=False, server="android", server_time=1700000000,
-                     maintenance_at=None):
+                     maintenance_at=None, recovery_elapsed=0):
         profile = SimpleNamespace(version="test", development_code="test", session_prefix="prefix")
         client = SaplingClient(profile, server)
         host, channel, platform = {
@@ -46,7 +46,7 @@ class SaplingExchangeTests(unittest.TestCase):
             elif key == "toplogin":
                 root = {"response": [response("login", {}, usk="top-token")], "cache": {
                     "serverTime": server_time, "replaced": {
-                        "userGame": [dict(userId="42", actMax=147, actRecoverAt=server_time + (147 - ap) * 300,
+                        "userGame": [dict(userId="42", actMax=147, actRecoverAt=server_time + (147 - ap) * 300 - recovery_elapsed,
                                           carryOverActPoint=0)],
                         "userItem": [dict(itemId="103", num=saplings), dict(itemId="104", num=5)],
                     },
@@ -69,7 +69,7 @@ class SaplingExchangeTests(unittest.TestCase):
                 num = int(params["num"])
                 root = {"response": [response("purchase", dict(PurchaseNum=num))], "cache": {
                     "serverTime": server_time, "updated": {
-                        "userGame": [dict(userId="42", actRecoverAt=server_time + (147 - ap + 40 * num) * 300)],
+                        "userGame": [dict(userId="42", actRecoverAt=server_time + (147 - ap + 40 * num) * 300 - recovery_elapsed)],
                         "userItem": [dict(itemId="103", num=saplings - num), dict(itemId="104", num=5 + num)],
                     },
                 }}
@@ -133,3 +133,12 @@ class SaplingExchangeTests(unittest.TestCase):
         self.assertIn("剩余 AP：15", reply)
         self.assertIn("预计AP将于明天01:06恢复到40AP。", reply)
         self.assertIn("当前AP已达到40。", self.run_exchange(1, ap=95, server_time=evening))
+
+    def test_recovery_to_40_accounts_for_partial_cycle_and_rounds_up_to_minute(self):
+        zone = timezone(timedelta(hours=8))
+        now = int(datetime(2026, 11, 12, 12, 0, 10, tzinfo=zone).timestamp())
+        for ap, elapsed, expected in ((39, 280, "12:01"), (39, 250, "12:01"),
+                                      (39, 0, "12:06"), (95, 280, "14:01")):
+            with self.subTest(ap=ap, elapsed=elapsed):
+                reply = self.run_exchange(None, ap=ap, server_time=now, recovery_elapsed=elapsed)
+                self.assertIn(f"预计AP将于今天{expected}恢复到40AP。", reply)

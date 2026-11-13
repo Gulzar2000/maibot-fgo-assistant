@@ -124,8 +124,9 @@ class SaplingClient(GameClient):
         if current_ap >= AP_COST:
             threshold_message = "当前AP已达到40。"
         else:
-            # 按每点 5 分钟粗估，不扣除当前未结束的恢复周期。
-            recover_to_40 = server_time + (AP_COST - current_ap) * 300
+            # 从回满时间还原下一点 AP 的剩余秒数，扣除本轮已经过去的恢复时间。
+            seconds_to_next_ap = (recover_at - server_time - 1) % 300 + 1
+            recover_to_40 = server_time + seconds_to_next_ap + (AP_COST - current_ap - 1) * 300
             threshold_message = f"预计AP将于{time_label(recover_to_40)}恢复到40AP。"
         return full_message + "\n" + threshold_message
 
