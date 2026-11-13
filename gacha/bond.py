@@ -15,6 +15,7 @@ from .real_statistics import count, table
 
 DATA_URL = "https://api.atlasacademy.io/export/CN/nice_servant.json"
 ENTITY_URL = "https://api.atlasacademy.io/repo/CN/master/mstSvt.json"
+MASH_SVT_ID = "800100"
 # 国服普通羁绊奖励。安哥拉曼纽实际为 6~9 绊各 2 石，不能套用一星。
 REWARDS = {0: {6: 2, 7: 2, 8: 2, 9: 2}, 1: {9: 1}, 2: {8: 1, 9: 1},
            3: {6: 1, 7: 1, 8: 1, 9: 1}, 4: {6: 2, 7: 2, 8: 2, 9: 2},
@@ -49,7 +50,7 @@ def download_metadata() -> dict:
             continue
         servants[ident] = {"id": row["id"], "no": row["collectionNo"], "name": row["name"],
                            "rarity": row["rarity"], "growth": row["bondGrowth"],
-                           "excluded": row["type"] == "heroine"}
+                           "excluded": row["type"] == "heroine" and ident != MASH_SVT_ID}
     # 礼装也可能出现在图鉴表中；必须按真实索引排除，不能按 ID 范围猜测。
     for row in json.loads(_fetch_bytes_sync("https://api.atlasacademy.io/export/CN/basic_equip.json")):
         servants[str(row["id"])] = {"excluded": True}
@@ -77,10 +78,11 @@ class BondStore:
             return data
 
 
-def rewards(rarity: int) -> Dict[int, int]:
+def rewards(rarity: int, *, is_mash: bool = False) -> Dict[int, int]:
     if rarity not in REWARDS:
         raise BondDataError("出现未知星级，请联系管理员更新羁绊数据。")
-    return dict(REWARDS[rarity]) | {level: 30 for level in range(11, 16)}
+    # 玛修普通段固定为 6～9 绊每级 2 石，不随剧情中的星级变化。
+    return dict(REWARDS[4 if is_mash else rarity]) | {level: 30 for level in range(11, 16)}
 
 
 def build_bond_report(root: dict, metadata: dict, previous: Optional[dict] = None) -> dict:
@@ -106,23 +108,26 @@ def build_bond_report(root: dict, metadata: dict, previous: Optional[dict] = Non
         if ident not in metadata["servants"]:
             raise BondDataError(f"羁绊数据缺少图鉴 ID {ident}，请联系管理员更新。")
         info = metadata["servants"][ident]
-        if info["excluded"]:
+        is_mash = ident == MASH_SVT_ID
+        # 旧公共缓存仍将玛修标为 excluded，但已保存完整经验表，无需重新下载。
+        if info["excluded"] and not is_mash:
             excluded += 1
             continue
         rank = count(row, "friendshipRank")
-        cap = 10 + count(row, "friendshipExceedCount")
+        # 玛修的基础上限为 5；前五次 exceed 是剧情开放，不是投入梦火。
+        cap = (5 if is_mash else 10) + count(row, "friendshipExceedCount")
         exp = count(row, "friendship")
         if not 0 <= rank <= cap <= 15:
             raise BondDataError(f"从者 {ident} 的羁绊等级或上限无效。")
         growth = info["growth"]
         if len(growth) < cap or (rank < cap and exp > growth[rank]):
             raise BondDataError(f"从者 {ident} 的羁绊经验与数据表不一致。")
-        schedule = rewards(info["rarity"])
+        schedule = rewards(info["rarity"], is_mash=is_mash)
         normal = sum(value for level, value in schedule.items() if rank < level <= 9)
         dream = max(0, cap - max(10, rank)) * 30
         earned = sum(value for level, value in schedule.items() if level <= rank)
         current = {"key": str(info["no"]), "name": info["name"], "rarity": info["rarity"],
-                   "rank": rank, "cap": cap, "exp": exp,
+                   "rank": rank, "cap": cap, "exp": exp, "is_mash": is_mash,
                    "next": max(0, growth[rank] - exp) if rank < cap else None,
                    "normal": normal, "dream": dream, "earned": earned,
                    "remaining": normal + dream}
@@ -140,12 +145,12 @@ def build_bond_report(root: dict, metadata: dict, previous: Optional[dict] = Non
               "servants": rows, "excluded": excluded,
               "normal": sum(row["normal"] for row in rows), "dream": sum(row["dream"] for row in rows),
               "earned": sum(row["earned"] for row in rows),
-              "dreamfire_used": sum(row["cap"] - 10 for row in rows),
+              "dreamfire_used": sum(max(0, row["cap"] - 10) for row in rows),
               "dreamfire_rewarded": sum(max(0, row["rank"] - 10) for row in rows),
               "dreamfire_pending": sum(max(0, row["cap"] - max(10, row["rank"])) for row in rows),
               "dreamfire_inventory": dreamfire_inventory}
     # 只按背包真实数量估算额外潜力；投入空间只用于防止超出所有从者 15 绊上限。
-    available_slots = sum(15 - row["cap"] for row in rows)
+    available_slots = sum(15 - max(10, row["cap"]) for row in rows)
     report["dreamfire_usable"] = min(dreamfire_inventory, available_slots)
     report["inventory_quartz"] = report["dreamfire_usable"] * 30
     report["remaining"] = report["normal"] + report["dream"]
@@ -170,9 +175,9 @@ def compare_snapshots(current: dict, previous: Optional[dict]) -> Optional[dict]
         before = old[key]
         if row["rank"] < before["rank"] or row["cap"] < before["cap"]:
             raise BondDataError("同一角色羁绊进度发生回退，已停止对比，请管理员检查快照。")
-        schedule = rewards(row["rarity"])
+        schedule = rewards(row["rarity"], is_mash=row["is_mash"])
         gained += sum(value for level, value in schedule.items() if before["rank"] < level <= row["rank"])
-        unlocked += (row["cap"] - before["cap"]) * 30
+        unlocked += (max(10, row["cap"]) - max(10, before["cap"])) * 30
         if row["rank"] != before["rank"] or row["cap"] != before["cap"]:
             changes.append(f"{row['name']}：{before['rank']}/{before['cap']} → {row['rank']}/{row['cap']} 绊")
     return {"since": previous["captured_at"], "gained": gained, "unlocked": unlocked,

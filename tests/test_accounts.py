@@ -1,5 +1,6 @@
 """合成账号测试，不调用官方登录，不使用任何真实用户凭据。"""
 from copy import deepcopy
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from threading import Event
@@ -14,7 +15,7 @@ import unittest
 
 from test_pool_query import ROOT, plugin
 from gacha.accounts import AccountStore, qr_image
-from gacha.account_protocol.errors import ExportError
+from gacha.account_protocol.errors import ExportError, MAINTENANCE_MESSAGE, check_maintenance
 from gacha.account_protocol.protocol import GameClient
 from gacha.credentials import protect
 from gacha.real_statistics import format_real_statistics
@@ -98,6 +99,26 @@ class RealStatisticsTests(unittest.TestCase):
 
 
 class CredentialTests(unittest.TestCase):
+    def test_maintenance_time_is_extracted_from_actual_detail_format(self):
+        for newline in ("\n", "\\n"):
+            with self.subTest(newline=newline):
+                detail = newline.join(("目前迦勒底正在维护调整中", "预计开放时间：",
+                                       "公元2026年11月13日 19:00", "synthetic-private-data"))
+                with self.assertRaises(ExportError) as caught:
+                    check_maintenance({"fail": {"action": "maintain", "detail": detail}})
+                error = caught.exception
+                self.assertEqual(error.maintenance_end, datetime(2026, 11, 13, 19))
+                self.assertEqual(str(error), "SERVER_MAINTENANCE")
+                self.assertIn("预计开服时间：2026-11-13 19:00（北京时间，以实际开服为准）", error.maintenance_message)
+                self.assertNotIn("synthetic-private-data", error.maintenance_message)
+
+    def test_maintenance_without_valid_time_still_reports_maintenance(self):
+        for detail in (None, "维护结束时间未定", "预计开放时间：公元2026年2月30日 19:00"):
+            with self.subTest(detail=detail), self.assertRaises(ExportError) as caught:
+                check_maintenance({"fail": {"action": "maintain", "detail": detail}})
+            self.assertIsNone(caught.exception.maintenance_end)
+            self.assertEqual(caught.exception.maintenance_message, MAINTENANCE_MESSAGE)
+
     def test_maintenance_marker_stops_login_at_first_request(self):
         client = GameClient(SimpleNamespace(version="test", development_code="test"), "android")
         raw = b'{"response":[{"nid":"","resCode":"88","fail":{"action":"maintain"}}]}'
@@ -191,16 +212,43 @@ class AccountCommandTests(unittest.IsolatedAsyncioTestCase):
         self.store.query_real.side_effect = plugin.ExportError("SERVER_MAINTENANCE")
         await self.instance.cmd_stat_real("group", "12345678", platform="qq")
         await self.drain()
-        self.assertEqual(self.send.text.call_args.args[0], plugin.MAINTENANCE_MESSAGE)
+        self.assertEqual(self.send.text.call_args.args[0], MAINTENANCE_MESSAGE)
         self.store.exchange_saplings = MagicMock(side_effect=plugin.ExportError("SERVER_MAINTENANCE"))
         await self.instance.cmd_tree("group", "12345678", "qq", text="/fgo tree")
         await self.drain()
-        self.assertEqual(self.send.text.call_args.args[0], plugin.MAINTENANCE_MESSAGE)
+        self.assertEqual(self.send.text.call_args.args[0], MAINTENANCE_MESSAGE)
         self.store.fetch.side_effect = plugin.ExportError("SERVER_MAINTENANCE")
         with patch.object(plugin, "qr_image", return_value="synthetic-png"):
             await self.bind()
             await self.drain()
-        self.assertEqual(self.send.text.call_args.args[0], plugin.MAINTENANCE_MESSAGE)
+        self.assertEqual(self.send.text.call_args.args[0], MAINTENANCE_MESSAGE)
+        self.store.save.assert_not_called()
+
+    async def test_maintenance_time_is_shown_for_bind_real_bond_and_tree(self):
+        error = plugin.ExportError("SERVER_MAINTENANCE", maintenance_end=datetime(2026, 11, 13, 19))
+
+        async def invoke(function, *args, **kwargs):
+            # 此处仅验证提示传递，不依赖线程池调度。
+            return function(*args, **kwargs)
+
+        self.store.load.side_effect = lambda *_: {"server": "android", "user": {"uid": "1", "access_key": "test"}}
+        self.store.query_real.side_effect = error
+        self.store.query_bond = MagicMock(side_effect=error)
+        self.store.exchange_saplings = MagicMock(side_effect=error)
+        self.store.fetch.side_effect = error
+        with patch.object(plugin.asyncio, "to_thread", side_effect=invoke), patch.object(plugin, "qr_image", return_value="png"):
+            await self.instance.cmd_stat_real("group", "12345678", platform="qq")
+            await self.drain()
+            self.assertEqual(self.send.text.call_args.args[0], error.maintenance_message)
+            await self.instance.cmd_bond("group", "12345678", "qq")
+            await self.drain()
+            self.assertEqual(self.send.text.call_args.args[0], error.maintenance_message)
+            await self.instance.cmd_tree("group", "12345678", "qq", text="/fgo tree")
+            await self.drain()
+            self.assertEqual(self.send.text.call_args.args[0], error.maintenance_message)
+            await self.bind()
+            await self.drain()
+            self.assertEqual(self.send.text.call_args.args[0], error.maintenance_message)
         self.store.save.assert_not_called()
 
     async def test_tree_passes_optional_quantity_from_qq_command(self):

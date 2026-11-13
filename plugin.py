@@ -28,7 +28,7 @@ from .gacha.downloader import build_card_name_map
 from .gacha.statistics import format_draw_statistics
 from .gacha.accounts import AccountStore, qr_image
 from .gacha.rate_chart import CaptureReport
-from .gacha.account_protocol.errors import MAINTENANCE_MESSAGE, ExportError
+from .gacha.account_protocol.errors import ExportError
 from .gacha.credentials import validate_credentials
 from .gacha.events import DEFAULT_ALIAS_RULES, fetch_events, format_event_messages, normalize_event_keyword
 from .gacha.material_image import render_material_report
@@ -219,8 +219,8 @@ class FgoGachaPlugin(MaiBotPlugin):
                 # 不记录异常报文或 traceback，避免第三方异常携带登录凭据。
                 code = error.code if isinstance(error, ExportError) else type(error).__name__
                 logger.error("FGO 账号操作失败：%s", code)
-                if code == "SERVER_MAINTENANCE":
-                    await self.ctx.send.text(MAINTENANCE_MESSAGE, stream_id)
+                if isinstance(error, ExportError) and code == "SERVER_MAINTENANCE":
+                    await self.ctx.send.text(error.maintenance_message, stream_id)
                     return
                 await self.ctx.send.text(
                     f"FGO 账号操作失败（{code}）。授权失效请重新 /fgo bind；其他错误请联系管理员。",
@@ -517,8 +517,8 @@ class FgoGachaPlugin(MaiBotPlugin):
             except Exception as error:
                 code = error.code if isinstance(error, ExportError) else type(error).__name__
                 logger.error("FGO 真实统计查询失败：%s", code)
-                if code == "SERVER_MAINTENANCE":
-                    real = MAINTENANCE_MESSAGE
+                if isinstance(error, ExportError) and code == "SERVER_MAINTENANCE":
+                    real = error.maintenance_message
                 else:
                     real = f"真实出率：查询失败（{code}），授权失效请重新 /fgo bind。"
             finally:
@@ -602,7 +602,7 @@ class FgoGachaPlugin(MaiBotPlugin):
                 reply = await asyncio.to_thread(self.accounts.exchange_saplings, user_id, quantity, cancel)
             except ExportError as error:
                 if error.code == "SERVER_MAINTENANCE":
-                    reply = MAINTENANCE_MESSAGE
+                    reply = error.maintenance_message
                 elif error.code == "PURCHASE_RESULT_UNCONFIRMED":
                     reply = "兑换结果未确认，请先在游戏内核对青铜果实数量，再决定是否重试。"
                 else:

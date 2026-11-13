@@ -40,6 +40,55 @@ def root(*rows: dict) -> dict:
 
 
 class BondTests(unittest.TestCase):
+    def test_mash_story_unlocks_and_dreamfire_with_old_and_new_metadata(self):
+        for excluded in (True, False):
+            data = metadata()
+            data["servants"]["800100"] = dict(data["servants"]["2"], id=800100, no=1,
+                                              name="玛修", rarity=3, excluded=excluded)
+            for rank, cap in ((0, 5), (5, 5), (8, 8), (9, 9), (10, 10), (10, 11), (11, 11), (15, 15)):
+                with self.subTest(excluded=excluded, rank=rank, cap=cap):
+                    row = dict(collection(800100, rank), friendshipExceedCount=cap - 5)
+                    report = build_bond_report(root(row), data)
+                    self.assertEqual(len(report["servants"]), 1)
+                    self.assertEqual(report["servants"][0]["cap"], cap)
+                    self.assertEqual(report["normal"], min(4, max(0, 9 - rank)) * 2)
+                    self.assertEqual(report["dreamfire_used"], max(0, cap - 10))
+                    self.assertEqual(report["dreamfire_rewarded"], max(0, rank - 10))
+                    self.assertEqual(report["dreamfire_pending"], max(0, cap - max(10, rank)))
+                    self.assertEqual(report["dream"], 30 if (rank, cap) == (10, 11) else 0)
+                    self.assertEqual(report["earned"], min(4, max(0, rank - 5)) * 2 + max(0, rank - 10) * 30)
+                    self.assertEqual(report["dreamfire_usable"], min(3, 15 - max(10, cap)))
+
+    def test_mash_story_progress_gives_normal_rewards_but_not_dreamfire_unlocks(self):
+        data = metadata()
+        data["servants"]["800100"] = dict(data["servants"]["2"], id=800100, no=1, excluded=True)
+        previous = None
+        for rank, cap, gained, unlocked in ((5, 5, 0, 0), (9, 9, 8, 0), (10, 10, 0, 0),
+                                           (10, 11, 0, 30), (11, 12, 30, 30)):
+            report = build_bond_report(
+                root(dict(collection(800100, rank), friendshipExceedCount=cap - 5)), data, previous
+            )
+            if previous is not None:
+                self.assertEqual(report["comparison"]["gained"], gained)
+                self.assertEqual(report["comparison"]["unlocked"], unlocked)
+            previous = report
+
+    def test_mash_adds_missing_pending_dreamfire_to_existing_snapshot(self):
+        data = metadata()
+        data["servants"]["800100"] = dict(data["servants"]["2"], id=800100, no=1, excluded=True)
+        previous = build_bond_report(root(collection(2, 11, 12)), data)
+        # 已落盘的旧快照没有玛修，也没有新增的 is_mash 字段。
+        for row in previous["servants"]:
+            del row["is_mash"]
+        report = build_bond_report(root(collection(2, 11, 12),
+                                        dict(collection(800100, 10), friendshipExceedCount=6)), data, previous)
+        self.assertEqual(report["dreamfire_used"], previous["dreamfire_used"] + 1)
+        self.assertEqual(report["dreamfire_pending"], previous["dreamfire_pending"] + 1)
+        self.assertEqual(report["remaining"], previous["remaining"] + 30)
+        self.assertEqual(report["comparison"]["gained"], 0)
+        self.assertEqual(report["comparison"]["unlocked"], 0)
+        self.assertEqual(report["comparison"]["added"], 1)
+
     def test_noble_phantasm_entities_are_not_independent_bond_servants(self):
         data = metadata()
         add_noncollection_entities(data["servants"], [
