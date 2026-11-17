@@ -35,6 +35,7 @@ from .gacha.material_image import render_material_report
 from .gacha.materials import MaterialQueryError, MaterialService
 from .gacha.bond import BondDataError
 from .gacha.planning import PlanDataError
+from .gacha.tree_schedule import TreeScheduleStore, parse_tree_time, tree_now
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,20 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_icon__ = "package"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.0.4", description="配置版本")
+    config_version: str = Field(default="1.0.5", description="配置版本")
+
+
+class TreeConfig(PluginConfigBase):
+    __ui_label__ = "自动种树"
+    __ui_icon__ = "clock"
+    latest_time: str = Field(default="22:00", description="当天自动种树最晚预约时间（北京时间，24小时制 HH:MM，含该时刻）")
+
+    @field_validator("latest_time")
+    @classmethod
+    def validate_latest_time(cls, value: str) -> str:
+        if re.fullmatch(r"(?:[01][0-9]|2[0-3])[:：][0-5][0-9]", value) is None:
+            raise ValueError("最晚预约时间须为24小时制 HH:MM")
+        return value.replace("：", ":")
 
 
 class FgoGachaConfig(PluginConfigBase):
@@ -121,6 +135,7 @@ class FgoGachaConfig(PluginConfigBase):
     gacha: GachaConfig = Field(default_factory=GachaConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
     real_statistics: RealStatisticsConfig = Field(default_factory=RealStatisticsConfig)
+    tree: TreeConfig = Field(default_factory=TreeConfig)
 
 
 class FgoGachaPlugin(MaiBotPlugin):
@@ -137,16 +152,25 @@ class FgoGachaPlugin(MaiBotPlugin):
         self._account_unbinding: Set[str] = set()
         self._accounts: Optional[AccountStore] = None
         self._materials: Optional[MaterialService] = None
+        self._tree_schedules: Optional[TreeScheduleStore] = None
+        self._tree_task: Optional[asyncio.Task] = None
 
     async def on_load(self) -> None:
         data_dir = os.path.join(self.ctx.paths.data_dir, "fgogacha")
         os.makedirs(data_dir, exist_ok=True)
         self._pool_manager = PoolManager(data_dir)
+        self._tree_schedules = TreeScheduleStore(Path(data_dir) / "tree_schedules.json")
+        await self._tree_schedules.load(tree_now())
+        self._tree_task = asyncio.create_task(self._run_tree_schedules())
 
         if self.config.gacha.auto_update_hours > 0:
             self._start_auto_update()
 
     async def on_unload(self) -> None:
+        if self._tree_task:
+            self._tree_task.cancel()
+            await asyncio.gather(self._tree_task, return_exceptions=True)
+            self._tree_task = None
         for cancel in self._account_cancels.values():
             cancel.set()
         jobs = list(self._account_jobs.values())
@@ -335,6 +359,8 @@ class FgoGachaPlugin(MaiBotPlugin):
                 self._account_jobs.pop(user_id, None)
                 self._account_cancels.pop(user_id, None)
             await asyncio.to_thread(self.accounts.delete, user_id)
+            if self._tree_schedules is not None:
+                await self._tree_schedules.cancel(user_id)
         finally:
             self._account_unbinding.discard(user_id)
         text = "已解除 FGO 绑定并删除本地登录凭据，真实出率历史与模拟抽卡记录保留。"
@@ -375,6 +401,7 @@ class FgoGachaPlugin(MaiBotPlugin):
             "/fgo stat real — 抓取真实账号的AP、五星出率与评级\n"
             "/fgo 羁绊计算 或 /fgo 挖矿 — 查询羁绊剩余圣晶石与进度变化\n"
             "/fgo tree [兑换数] — 兑换青铜果实，省略数量则兑换最多可换个数\n"
+            "/fgo tree HH:MM — 预约当天自动种树；/fgo tree cancel 取消\n"
             "\n"
             "每个青铜果实消耗40 AP和1株青铜树苗。\n"
             "真实账号查询及兑换需要先绑定，登录可能使游戏掉线。\n"
@@ -612,44 +639,121 @@ class FgoGachaPlugin(MaiBotPlugin):
         if not sent:
             raise ExportError("STATISTICS_SEND_FAILED")
 
-    @Command(
-        name="fgo_tree",
-        description="兑换青铜果实，省略兑换数则按当前 AP 和库存兑换最大个数",
-        pattern=r"^/fgo\s+(?:tree|种树)(?:[ \t]+[^\r\n]*)?\s*$",
-    )
-    async def cmd_tree(self, stream_id: str = "", user_id: str = "", platform: str = "",
-                       message: Any = "", **kwargs) -> tuple[bool, str, bool]:
-        if platform != "qq" or not stream_id:
-            return True, "仅支持在 QQ 中兑换青铜果实。", True
+    async def _tree_reply(self, user_id: str, quantity: Optional[int], cancel: Event) -> str:
         try:
-            user_id = normalize_qq_user_id(user_id)
-        except ValueError as error:
-            return True, f"{error}，无法兑换。", True
-        text = kwargs.get("text", message if isinstance(message, str) else "")
-        match = re.fullmatch(r"/fgo\s+(?:tree|种树)(?:[ \t]+([0-9]{1,9}))?\s*", text)
-        quantity = int(match[1]) if match and match[1] is not None else None
-        if match is None or quantity == 0:
-            usage = "兑换数须为正整数。中文别名：/fgo 种树 [兑换数]。发送 /fgo tree 兑换当前最大个数，或 /fgo tree 1 兑换 1 个。"
-            await self.ctx.send.text(usage, stream_id)
-            return True, usage, True
+            return await asyncio.to_thread(self.accounts.exchange_saplings, user_id, quantity, cancel)
+        except ExportError as error:
+            if error.code == "SERVER_MAINTENANCE":
+                return error.maintenance_message
+            if error.code == "PURCHASE_RESULT_UNCONFIRMED":
+                return "兑换结果未确认，请先在游戏内核对青铜果实数量，再决定是否重试。"
+            return f"兑换失败（{error.code}）。"
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            logger.error("FGO 兑换预检失败：%s", type(error).__name__)
+            return "兑换失败，无法读取账号或库存数据。"
+
+    async def _send_tree_notice(self, job: Dict[str, str], reply: str) -> None:
+        if not await self.ctx.send.hybrid([
+            {"type": "at", "data": {"target_user_id": job["user_id"]}},
+            {"type": "text", "content": "\n自动种树：" + reply},
+        ], job["stream_id"]):
+            logger.error("FGO 自动种树结果通知发送失败")
+
+    async def _execute_tree_schedule(self, job: Dict[str, str]) -> None:
+        user_id, stream_id = job["user_id"], job["stream_id"]
+        stream = await self.ctx.chat.get_stream_by_group_id(job["group_id"], "qq")
+        if not stream or stream["session_id"] != stream_id or not stream["is_group_session"]:
+            logger.error("FGO 自动种树无法确认登记群的真实聊天流，未登录")
+            return
 
         async def exchange(cancel: Event):
             try:
-                reply = await asyncio.to_thread(self.accounts.exchange_saplings, user_id, quantity, cancel)
-            except ExportError as error:
-                if error.code == "SERVER_MAINTENANCE":
-                    reply = error.maintenance_message
-                elif error.code == "PURCHASE_RESULT_UNCONFIRMED":
-                    reply = "兑换结果未确认，请先在游戏内核对青铜果实数量，再决定是否重试。"
-                else:
-                    reply = f"兑换失败（{error.code}）。"
-            except (KeyError, OSError, TypeError, ValueError) as error:
-                logger.error("FGO 兑换预检失败：%s", type(error).__name__)
-                reply = "兑换失败，无法读取账号或库存数据。"
+                reply = await self._tree_reply(user_id, None, cancel)
+            except Exception as error:
+                # 仅暴露异常类型，不输出可能包含凭据的异常内容。
+                logger.error("FGO 自动种树失败：%s", type(error).__name__)
+                reply = f"兑换失败（{type(error).__name__}）。"
+            if not cancel.is_set():
+                await self._send_tree_notice(job, reply)
+
+        if not self._start_account_job(user_id, stream_id, exchange):
+            await self._send_tree_notice(job, "已有账号操作正在进行，本次预约未执行，请稍后手动种树。")
+
+    async def _run_tree_schedules(self) -> None:
+        assert self._tree_schedules is not None
+        while True:
+            for job in await self._tree_schedules.take_due(tree_now()):
+                try:
+                    await self._execute_tree_schedule(job)
+                except Exception as error:
+                    logger.error("FGO 自动种树调度失败：%s", type(error).__name__)
+            await asyncio.sleep(1)
+
+    @Command(
+        name="fgo_tree",
+        description="兑换青铜果实；HH:MM 预约当天自动种树，cancel/取消 撤销预约",
+        pattern=r"^/fgo\s+(?:tree|种树)(?:[ \t]+[^\r\n]*)?\s*$",
+    )
+    async def cmd_tree(self, stream_id: str = "", user_id: str = "", platform: str = "",
+                       message: Any = "", group_id: str = "", **kwargs) -> tuple[bool, str, bool]:
+        if platform != "qq" or not stream_id:
+            return True, "仅支持在 QQ 中兑换青铜果实。", True
+
+        async def respond(reply: str) -> tuple[bool, str, bool]:
+            # 命令返回的文字仅用于处理结果；QQ 可见回执必须显式发送。
+            if not await self.ctx.send.text(reply, stream_id):
+                raise ExportError("TREE_REPLY_SEND_FAILED")
+            return True, reply, True
+
+        try:
+            user_id = normalize_qq_user_id(user_id)
+        except ValueError as error:
+            return await respond(f"{error}，无法兑换。")
+        text = kwargs.get("text", message if isinstance(message, str) else "")
+        arguments = re.fullmatch(r"/fgo\s+(?:tree|种树)(?:[ \t]+([^\r\n]*?))?\s*", text)
+        argument = arguments[1].strip() if arguments and arguments[1] else ""
+        if argument in ("cancel", "取消"):
+            assert self._tree_schedules is not None
+            previous = await self._tree_schedules.cancel(user_id)
+            return await respond("已取消自动种树预约。" if previous else "当前没有待执行的自动种树预约（已开始的兑换无法撤回）。")
+        if ":" in argument or "：" in argument:
+            if not group_id:
+                return await respond("请在需要接收通知的 QQ 群中预约自动种树。")
+            try:
+                at = parse_tree_time(argument, self.config.tree.latest_time, tree_now())
+            except ValueError as error:
+                return await respond(str(error))
+            stream = await self.ctx.chat.get_stream_by_group_id(group_id, "qq")
+            if not stream or stream["session_id"] != stream_id or not stream["is_group_session"]:
+                return await respond("无法确认 QQ 群聊天会话，未注册预约。")
+            saved = await asyncio.to_thread(self.accounts.load, user_id)
+            if saved is None:
+                return await respond("尚未绑定 FGO 账号，请先 /fgo bind。")
+            saved["user"].clear()
+            assert self._tree_schedules is not None
+            # 预检可能耗时，写入前再次检查，避免把已过时的预约登记成功。
+            try:
+                at = parse_tree_time(argument, self.config.tree.latest_time, tree_now())
+            except ValueError as error:
+                return await respond(str(error))
+            previous = await self._tree_schedules.register(user_id, group_id, stream_id, at)
+            prefix = f"已取消前一次自动种树预约（{previous['at'][11:16]}）。\n" if previous else ""
+            return await respond(
+                prefix + f"自动种树已注册成功：今天北京时间 {at:%H:%M} 自动登录并兑换当前最多可换的青铜果实，结果将在本群通知并 @ 你。\n"
+                "取消方法：/fgo tree cancel 或 /fgo 种树 取消。"
+            )
+        match = re.fullmatch(r"/fgo\s+(?:tree|种树)(?:[ \t]+([0-9]{1,9}))?\s*", text)
+        quantity = int(match[1]) if match and match[1] is not None else None
+        if match is None or quantity == 0:
+            usage = "兑换数须为正整数。发送 /fgo tree 兑换当前最大个数，或 /fgo tree 1 兑换 1 个。群内发送 /fgo tree HH:MM 预约当天自动种树，/fgo tree cancel 取消；支持 /fgo 种树 和 取消。"
+            return await respond(usage)
+
+        async def exchange(cancel: Event):
+            reply = await self._tree_reply(user_id, quantity, cancel)
             await self.ctx.send.text(reply, stream_id)
 
         if not self._start_account_job(user_id, stream_id, exchange):
-            return True, "已有账号操作正在进行，请稍后再试。", True
+            return await respond("已有账号操作正在进行，请稍后再试。")
         return True, "", True
 
     # === /fgo init — 数据初始化 ===

@@ -1,6 +1,10 @@
 [plugin]
 enabled = true
-config_version = "1.0.4"
+config_version = "1.0.5"
+
+[tree]
+# 北京时间，24小时制 HH:MM；可预约到该时刻（含），仅限当天未来时间。
+latest_time = "22:00"
 
 [gacha]
 display_mode = "image"
