@@ -34,6 +34,7 @@ from .gacha.events import DEFAULT_ALIAS_RULES, fetch_events, format_event_messag
 from .gacha.material_image import render_material_report
 from .gacha.materials import MaterialQueryError, MaterialService
 from .gacha.bond import BondDataError
+from .gacha.planning import PlanDataError
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +382,7 @@ class FgoGachaPlugin(MaiBotPlugin):
             "【活动查询】\n"
             "/fgo events [关键词] — 查询国服活动排期\n"
             "例如 /fgo events 泳装、/fgo events 术冠\n"
+            "/fgo plan 或 /fgo 规划 — 四档养成素材缺口和进度长图\n"
             "/fgo material <素材> — 图片汇总 Free 本效率、活动奖励和未来交换券\n"
             "例如 /fgo 素材 羽毛、/fgo material 术金饼干\n"
             "\n"
@@ -555,6 +557,40 @@ class FgoGachaPlugin(MaiBotPlugin):
                 )
             except BondDataError as error:
                 await self.ctx.send.text("羁绊计算失败：" + str(error), stream_id)
+                return
+            finally:
+                saved["user"].clear()
+            if not cancel.is_set():
+                await self._send_capture_report(report, stream_id)
+
+        if not self._start_account_job(user_id, stream_id, query):
+            return True, "已有账号操作正在进行，请稍后再试。", True
+        return True, "", True
+
+    @Command(
+        name="fgo_plan",
+        description="计算绑定账号四档养成目标的素材缺口和进度",
+        pattern=r"^/fgo\s+(?:plan|规划)\s*$",
+    )
+    async def cmd_plan(self, stream_id: str = "", user_id: str = "", platform: str = "", **kwargs) -> tuple[bool, str, bool]:
+        if platform != "qq":
+            return True, "养成规划仅支持 QQ 绑定账号。", True
+        try:
+            user_id = normalize_qq_user_id(user_id)
+        except ValueError as error:
+            return True, str(error), True
+
+        async def query(cancel: Event):
+            saved = await asyncio.to_thread(self.accounts.load, user_id)
+            if saved is None:
+                await self.ctx.send.text("尚未绑定 FGO 账号，请使用 /fgo bind 扫码绑定。", stream_id)
+                return
+            try:
+                report = await asyncio.to_thread(
+                    self.accounts.query_plan, user_id, saved["server"], dict(saved["user"]), cancel,
+                )
+            except PlanDataError as error:
+                await self.ctx.send.text("养成规划失败：" + str(error), stream_id)
                 return
             finally:
                 saved["user"].clear()

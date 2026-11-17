@@ -1,6 +1,6 @@
 [project]
 name = "maibot-fgo-assistant"
-version = "1.4.0"
+version = "1.4.1"
 requires-python = ">=3.12"
 dependencies = [
     "maibot-plugin-sdk>=2.12.0",

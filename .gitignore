@@ -26,6 +26,7 @@ game-protocol*.json
 /output/
 capture_history.json
 bond_history.json
+plan_history.json
 bond_capture_days.json
 *.db
 *.db-*

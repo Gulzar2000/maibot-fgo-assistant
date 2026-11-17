@@ -1,4 +1,5 @@
 """QQ 账号绑定、官方扫码和真实统计；阻塞方法由调用方放入线程执行。"""
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -24,6 +25,9 @@ from .rate_chart import CaptureReport, history_points, render_rate_chart
 from .bond import BondStore, build_bond_report
 from .bond_image import render_bond_report
 from .saplings import SaplingClient
+from .materials import MaterialService
+from .planning import PlanStore, build_plan_report
+from .plan_image import render_plan_report
 
 CAPTURE_CONFIRMATION = "你今天已经抓包过一次了，确定还要再抓包吗？"
 
@@ -40,6 +44,57 @@ class AccountStore:
         # 同一游戏账号的登录取数和兑换共用占用状态，即使由不同 QQ 触发。
         self._capture_active: Set[str] = set()
         self._bond_store = BondStore(directory.parent / "bond_metadata_cn.json")
+        self._plan_store = PlanStore(directory.parent)
+
+    def query_plan(
+        self, qq: str, server: str, user: dict, cancelled: Event,
+    ) -> str:
+        """规划只读登录，与其他账号操作共用互斥；公共数据和绘图均在线程执行。"""
+        key = self._capture_key(server, user)
+        try:
+            with self._lock:
+                if cancelled.is_set():
+                    raise ExportError("CANCELLED")
+                if key in self._capture_active:
+                    return "此 FGO 账号正在执行其他操作，请稍后再试。"
+                self._capture_active.add(key)
+            try:
+                metadata = self._plan_store.load()
+                if cancelled.is_set():
+                    raise ExportError("CANCELLED")
+                root = self.client(server).toplogin(dict(user), lambda phase: None, cancelled.is_set)
+                if cancelled.is_set():
+                    raise ExportError("CANCELLED")
+                game_key = game_history_key(root)
+                history_path = self.directory.parent / "plan_history.json"
+                with self._lock:
+                    history = json.loads(history_path.read_bytes()) if history_path.exists() else {}
+                    previous = history.get(game_key)
+                report = build_plan_report(root, metadata, previous)
+                icons = MaterialService(self.directory.parent / "materials")
+
+                def icon(row: dict) -> tuple:
+                    return row["id"], icons.load_icon(row["id"], row["icon"])
+
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    images = dict(pool.map(icon, [row for row in report["items"]
+                                                  if row["id"] != 1 and any(row["missing"])]))
+                if cancelled.is_set():
+                    raise ExportError("CANCELLED")
+                image = render_plan_report(report, str(self.metadata.parent), images)
+                # 只提交成功成图的精简快照；取消／解绑的迟到请求不得写回。
+                with self._lock:
+                    if cancelled.is_set():
+                        raise ExportError("CANCELLED")
+                    history = json.loads(history_path.read_bytes()) if history_path.exists() else {}
+                    history[game_key] = report["snapshot"]
+                    atomic_write(history_path, json_bytes(history))
+                return CaptureReport("养成规划：四档目标的素材缺口与当前进度。", image)
+            finally:
+                with self._lock:
+                    self._capture_active.remove(key)
+        finally:
+            user.clear()
 
     @staticmethod
     def _capture_day() -> str:
