@@ -1,11 +1,14 @@
-# 本机配置、应用协议参数与授权材料
-/private/
+# 本机配置与授权材料
+/private/*
 /config*.toml
 !/config.example.toml
 config_back/
 .env
 .env.*
 game-protocol*.json
+# 部署所需的两份应用级协议配置。
+!/private/game-protocol.json
+!/private/game-protocol-uo.json
 *.dpapi
 *.fgobind
 *.imported
