@@ -9,7 +9,7 @@ import csv
 import json
 import re
 
-from .downloader import download_file, fetch_text
+from .downloader import _valid_image, download_file, fetch_text
 
 INDEX_PAGES = {"svt": "英灵图鉴", "ce": "礼装图鉴"}
 INDEX_VERSION = 1
@@ -85,6 +85,16 @@ async def download_result_card(kind: str, number: str, icon_dir: str, index: Dic
     if card is None:
         raise ValueError(f"Mooncell 图鉴中找不到 {kind} #{number}")
     return await download_file(card["url"], str(result_card_path(icon_dir, kind, number)))
+
+
+async def load_framed_servant(number: str, icon_dir: str, index: Dict[str, Dict[str, dict]]) -> Optional[Path]:
+    # 旧版将同一份 Mooncell 带框成品存为 svt_*.jpg，可继续使用已有缓存。
+    legacy = Path(icon_dir) / f"svt_{number}.jpg"
+    if await asyncio.to_thread(_valid_image, str(legacy)):
+        return legacy
+    if await download_result_card("svt", number, icon_dir, index):
+        return result_card_path(icon_dir, "svt", number)
+    return None
 
 
 async def ensure_result_cards(result: List[dict], icon_dir: str) -> None:

@@ -1,12 +1,14 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$PythonRoot
+    [string]$PythonRoot,
+    [string]$ReleaseDirectory,
+    [string]$WebView2Package
 )
 $ErrorActionPreference = 'Stop'
 $pluginRoot = Split-Path $PSScriptRoot -Parent
 $buildRoot = Join-Path $pluginRoot ('.build\binding-' + [guid]::NewGuid().ToString('N'))
 $payload = Join-Path $buildRoot 'payload'
-$release = Join-Path $pluginRoot 'releases'
+$release = if ($ReleaseDirectory) { [IO.Path]::GetFullPath($ReleaseDirectory) } else { Join-Path $pluginRoot 'releases' }
 New-Item -ItemType Directory -Path $payload, $release -Force | Out-Null
 function Copy-Payload([string]$source, [string]$relative) {
     $target = Join-Path $payload $relative
@@ -38,18 +40,33 @@ foreach ($name in @('game-protocol.json', 'game-protocol-uo.json')) {
     Copy-Payload (Join-Path $pluginRoot ('private\' + $name)) ('backend\' + $name)
 }
 Copy-Payload (Join-Path $PSScriptRoot 'local_login.py') 'backend\local_login.py'
+Copy-Payload (Join-Path $PSScriptRoot 'password_verification.py') 'backend\password_verification.py'
 Copy-Payload (Join-Path $PSScriptRoot 'import-public.pem') 'backend\import-public.pem'
 Copy-Payload (Join-Path $PSScriptRoot '使用说明.md') '使用说明.md'
 foreach ($file in Get-ChildItem -LiteralPath $payload -File -Recurse) {
     if ($file.Name -match '\.dpapi$|\.fgobind$|import-private|credentials') { throw '禁止打包私钥或用户凭据' }
 }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+if (-not $WebView2Package) {
+    $WebView2Package = Join-Path $pluginRoot '.build\microsoft.web.webview2.1.0.4314.35.nupkg'
+}
+if (-not (Test-Path -LiteralPath $WebView2Package)) { throw '缺少 Microsoft.Web.WebView2 NuGet 包，请指定 -WebView2Package' }
+$webviewPayload = Join-Path $payload 'webview2'
+New-Item -ItemType Directory -Path $webviewPayload | Out-Null
+$webviewArchive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $WebView2Package).Path)
+try {
+    foreach ($name in @('lib/net462/Microsoft.Web.WebView2.Core.dll', 'lib/net462/Microsoft.Web.WebView2.WinForms.dll', 'runtimes/win-x64/native/WebView2Loader.dll', 'LICENSE.txt')) {
+        $entry = $webviewArchive.GetEntry($name)
+        if ($null -eq $entry) { throw ('WebView2 SDK 文件缺失：' + $name) }
+        [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $webviewPayload $entry.Name))
+    }
+} finally { $webviewArchive.Dispose() }
 $zip = Join-Path $buildRoot 'payload.zip'
 [IO.Compression.ZipFile]::CreateFromDirectory($payload, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $exe = Join-Path $release 'FGO账号绑定工具-便携版.exe'
 if (Test-Path -LiteralPath $exe) { Copy-Item -LiteralPath $exe -Destination (Join-Path $buildRoot 'previous.exe') }
-& $compiler /nologo /target:winexe /platform:x64 /optimize+ ("/out:" + $exe) ('/win32manifest:' + (Join-Path $PSScriptRoot 'app.manifest')) /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll ("/resource:" + $zip + ',payload.zip') (Join-Path $PSScriptRoot 'BindingTool.cs')
+& $compiler /nologo /target:winexe /platform:x64 /optimize+ ("/out:" + $exe) ('/win32manifest:' + (Join-Path $PSScriptRoot 'app.manifest')) /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll ("/r:" + (Join-Path $webviewPayload 'Microsoft.Web.WebView2.Core.dll')) ("/r:" + (Join-Path $webviewPayload 'Microsoft.Web.WebView2.WinForms.dll')) ("/resource:" + $zip + ',payload.zip') (Join-Path $PSScriptRoot 'BindingTool.cs')
 if ($LASTEXITCODE -ne 0) { throw '编译失败' }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot '使用说明.md') -Destination (Join-Path $release '使用说明.md')
 Write-Output ('EXE: ' + $exe)

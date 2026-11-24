@@ -4,12 +4,13 @@ from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from threading import Event, Lock
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 from PIL import Image, ImageDraw, ImageFont
 import base64
 import hashlib
 import json
+import logging
 import os
 
 from .account_protocol.errors import ExportError
@@ -24,12 +25,16 @@ from .real_statistics import build_real_statistics, count, table
 from .rate_chart import CaptureReport, history_points, render_rate_chart
 from .bond import BondStore, build_bond_report
 from .bond_image import render_bond_report
+from .box import BoxCard, build_box_cards, load_box_index, owned_servants
 from .saplings import SaplingClient
 from .materials import MaterialService
 from .planning import PlanStore, build_plan_report
 from .plan_image import render_plan_report
+from .quartz import QuartzSnapshot, merge_quartz_snapshot, quartz_points, read_quartz
+from .quartz_chart import render_quartz_chart
 
 CAPTURE_CONFIRMATION = "你今天已经抓包过一次了，确定还要再抓包吗？"
+logger = logging.getLogger(__name__)
 
 
 class AccountStore:
@@ -45,6 +50,81 @@ class AccountStore:
         self._capture_active: Set[str] = set()
         self._bond_store = BondStore(directory.parent / "bond_metadata_cn.json")
         self._plan_store = PlanStore(directory.parent)
+
+    def _record_quartz(self, root: dict, cancelled: Event) -> List[QuartzSnapshot]:
+        game_key, snapshot = read_quartz(root)
+        path = self.directory.parent / "quartz_history.json"
+        with self._lock:
+            if cancelled.is_set():
+                raise ExportError("CANCELLED")
+            history = json.loads(path.read_bytes()) if path.exists() else {}
+            daily = history.setdefault(game_key, {})
+            if merge_quartz_snapshot(daily, snapshot):
+                atomic_write(path, json_bytes(history))
+            return quartz_points(daily)
+
+    def _observe_quartz(self, root: dict, cancelled: Event) -> None:
+        if cancelled.is_set():
+            return
+        try:
+            self._record_quartz(root, cancelled)
+        except (AttributeError, KeyError, OSError, OverflowError, TypeError, ValueError) as error:
+            # 攒石记录失败时，保留原账号命令的执行路径；日志只记错误类型。
+            logger.warning("FGO 攒石记录失败：%s", type(error).__name__)
+
+    def _toplogin(self, client: GameClient, user: dict, cancelled: Event) -> dict:
+        root = client.toplogin(dict(user), lambda phase: None, cancelled.is_set)
+        self._observe_quartz(root, cancelled)
+        return root
+
+    def query_quartz(self, server: str, user: dict, cancelled: Event) -> str:
+        try:
+            key = self._capture_key(server, user)
+            with self._lock:
+                if cancelled.is_set():
+                    raise ExportError("CANCELLED")
+                if key in self._capture_active:
+                    return "此 FGO 账号正在执行其他操作，请稍后再试。"
+                self._capture_active.add(key)
+            try:
+                root = self.client(server).toplogin(dict(user), lambda phase: None, cancelled.is_set)
+                try:
+                    points = self._record_quartz(root, cancelled)
+                except (KeyError, OverflowError, TypeError, ValueError) as error:
+                    logger.warning("FGO 攒石查询失败：%s", type(error).__name__)
+                    return "攒石查询失败：账号库存或攒石历史数据无效，请联系管理员。"
+                image = render_quartz_chart(points, self.metadata.parent)
+                return CaptureReport(points[-1].message(), image)
+            finally:
+                with self._lock:
+                    self._capture_active.remove(key)
+        finally:
+            user.clear()
+
+    def query_box(self, server: str, user: dict, cancelled: Event) -> List[BoxCard] | str:
+        try:
+            key = self._capture_key(server, user)
+            with self._lock:
+                if cancelled.is_set():
+                    raise ExportError("CANCELLED")
+                if key in self._capture_active:
+                    return "此 FGO 账号正在执行其他操作，请稍后再试。"
+                self._capture_active.add(key)
+            try:
+                root = self._toplogin(self.client(server), user, cancelled)
+            finally:
+                with self._lock:
+                    self._capture_active.remove(key)
+        finally:
+            user.clear()
+        if cancelled.is_set():
+            raise ExportError("CANCELLED")
+        owned = owned_servants(root)
+        if not owned:
+            return []
+        index = load_box_index(self.directory.parent / "box_servants_cn.json",
+                               [count(row, "svtId") for row in owned])
+        return build_box_cards(root["cache"], owned, index)
 
     def query_plan(
         self, qq: str, server: str, user: dict, cancelled: Event,
@@ -62,7 +142,7 @@ class AccountStore:
                 metadata = self._plan_store.load()
                 if cancelled.is_set():
                     raise ExportError("CANCELLED")
-                root = self.client(server).toplogin(dict(user), lambda phase: None, cancelled.is_set)
+                root = self._toplogin(self.client(server), user, cancelled)
                 if cancelled.is_set():
                     raise ExportError("CANCELLED")
                 game_key = game_history_key(root)
@@ -185,7 +265,7 @@ class AccountStore:
                 metadata = self._bond_store.load()
                 if cancelled.is_set():
                     raise ExportError("CANCELLED")
-                root = self.client(server).toplogin(dict(user), lambda phase: None, cancelled.is_set)
+                root = self._toplogin(self.client(server), user, cancelled)
                 with self._lock:
                     days = self._bond_capture_days()
                     days[key] = self._capture_day()
@@ -296,7 +376,9 @@ class AccountStore:
                     return "此 FGO 账号正在执行其他操作，请稍后再试。"
                 self._capture_active.add(key)
             try:
-                return SaplingClient(self._profile(server), server).exchange(user, quantity, cancelled.is_set)
+                return SaplingClient(self._profile(server), server).exchange(
+                    user, quantity, cancelled.is_set, on_capture=lambda root: self._observe_quartz(root, cancelled),
+                )
             finally:
                 with self._lock:
                     self._capture_active.remove(key)
@@ -322,7 +404,7 @@ class AccountStore:
     ) -> str:
         # 协议层会清空传入凭据；仅保留本次请求内存中的原始响应。
         key = self._capture_key(client.server, user)
-        root = client.toplogin(dict(user), lambda phase: None, cancelled.is_set)
+        root = self._toplogin(client, user, cancelled)
         captured_day = self._capture_day()
         rate = None
         try:

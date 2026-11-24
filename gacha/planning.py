@@ -307,9 +307,13 @@ def compare_plan_snapshots(current: dict, previous: Optional[dict], metadata: di
     for ident, costumes in current["costumes"].items():
         new_costumes = set(costumes) - set(previous["costumes"].get(ident, []))
         for costume in new_costumes:
+            # 负数ID是已解锁标记，不代表已制作，不能按绝对值累计制作费用。
+            if costume < 0:
+                continue
             costs = metadata["servants"][ident]["costumeCosts"]
             if str(costume) not in costs:
-                raise PlanDataError(f"从者 {ident} 缺少灵衣 {costume} 的费用数据。")
+                # 公共数据未收录的灵衣按用户要求省略这项费用，不中断整份规划。
+                continue
             cost = costs[str(costume)]
             add(cost["items"], count(cost, "qp"))
     # 素材可能也花在冠位星图：缺口不包含冠位，但增量还原要识别其真实消耗。

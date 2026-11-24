@@ -1,5 +1,6 @@
 """国服青铜树苗兑换，沿用 Capture Kit 的会话及购买协议。"""
 from datetime import datetime, timedelta, timezone
+from random import uniform
 from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor
@@ -20,18 +21,19 @@ AP_COST = 40
 ACTION_PATH = "/rongame_beta/rgfate/60_1001/ac.php?"
 
 
+class SaplingExchangeSuccess(str):
+    """服务端已确认兑换后的结果，保留现有的文字回复格式。"""
+
+
 class SaplingClient(GameClient):
     def __init__(self, profile: GameProfile, server: str):
         super().__init__(profile, server)
         self._opener.add_handler(HTTPCookieProcessor())
-        self._account_channel = "996" if server == "ios" else "24"
-        self._account_platform = "2" if server == "ios" else "3"
         self._started = time.monotonic()
         self._session: Dict[str, Any] = {}
         self._inventory_cache: Dict[str, Any] = {}
 
     def _game(self, path: str, params: dict) -> Tuple[dict, dict]:
-        params = dict(params, rkchannel=self._account_channel)
         root, result = super()._game(path, params)
         if path.startswith(ACTION_PATH) and params.get("key") == "toplogin":
             self._session = {
@@ -97,6 +99,24 @@ class SaplingClient(GameClient):
         ap, _ = calculate_ap(game, self._inventory_cache)
         return ap, count(items.get(SAPLING_ID, {"num": 0}), "num"), count(items.get(FRUIT_ID, {"num": 0}), "num")
 
+    def _ap_reserve_message(self) -> str:
+        game = self._inventory_cache["userGame"][self._session["userId"]]
+        items = self._inventory_cache["userItem"]
+        max_ap = count(game, "actMax")
+        fruits = (
+            ("100", "黄金果实", max_ap),
+            ("101", "白银果实", (max_ap + 1) // 2),
+            (FRUIT_ID, "青铜果实", AP_COST),
+            ("102", "赤铜果实", 10),
+        )
+        reserve = 0
+        quantities = []
+        for item_id, name, recovery in fruits:
+            quantity = count(items.get(item_id, {"num": 0}), "num")
+            reserve += quantity * recovery
+            quantities.append(f"{name} {quantity} 个")
+        return f"剩余 AP 储备：{reserve} AP（{'、'.join(quantities)}）"
+
     def _ap_recovery_message(self) -> str:
         game = self._inventory_cache["userGame"][self._session["userId"]]
         server_time = count(self._inventory_cache, "serverTime")
@@ -130,15 +150,21 @@ class SaplingClient(GameClient):
             threshold_message = f"预计AP将于{time_label(recover_to_40)}恢复到40AP。"
         return full_message + "\n" + threshold_message
 
-    def exchange(self, user: dict, requested: Optional[int], cancelled: Callable[[], bool]) -> str:
+    def exchange(
+        self, user: dict, requested: Optional[int], cancelled: Callable[[], bool], *,
+        on_capture: Optional[Callable[[dict], None]] = None,
+    ) -> str:
         try:
             if requested is not None and (type(requested) is not int or requested < 1):
                 raise ValueError("兑换数须为正整数")
-            self.toplogin(user, lambda phase: None, cancelled)
+            root = self.toplogin(user, lambda phase: None, cancelled)
             if cancelled():
                 raise ExportError("CANCELLED")
+            if on_capture is not None:
+                on_capture(root)
+            del root
             # 等待后再读取 AP 和库存，兑换使用同一会话的最新数据。
-            time.sleep(2)
+            time.sleep(uniform(4, 6))
             if cancelled():
                 raise ExportError("CANCELLED")
             self._action("home")
@@ -147,9 +173,9 @@ class SaplingClient(GameClient):
             quantity = min(max_by_ap, saplings) if requested is None else requested
             if quantity > max_by_ap or max_by_ap == 0:
                 return (f"兑换失败，AP 不足。当前 AP 为 {ap}，按 AP 最多可兑换 {max_by_ap} 个。\n"
-                        + self._ap_recovery_message())
+                        f"{self._ap_reserve_message()}\n{self._ap_recovery_message()}")
             if quantity > saplings or quantity == 0:
-                return f"兑换失败，当前只有 {saplings} 株青铜树苗。"
+                return f"兑换失败，当前只有 {saplings} 株青铜树苗。\n{self._ap_reserve_message()}"
             if cancelled():
                 raise ExportError("CANCELLED")
             # 购买只提交一次，超时或回包缺失时避免重复扣除 AP 和库存。
@@ -169,8 +195,11 @@ class SaplingClient(GameClient):
                 raise ExportError("PURCHASE_RESULT_UNCONFIRMED") from None
             if not confirmed:
                 raise ExportError("PURCHASE_RESULT_UNCONFIRMED")
-            return (f"兑换成功，获得 {quantity} 个青铜果实，消耗 {quantity * AP_COST} AP。"
-                    f"剩余 AP：{after_ap}，青铜树苗：{after_saplings} 株。\n{recovery_message}")
+            return SaplingExchangeSuccess(
+                f"兑换成功，获得 {quantity} 个青铜果实，消耗 {quantity * AP_COST} AP。"
+                f"剩余 AP：{after_ap}，青铜树苗：{after_saplings} 株，现有青铜果实：{after_fruit} 个。\n"
+                f"{self._ap_reserve_message()}\n{recovery_message}"
+            )
         finally:
             user.clear()
             self._session.clear()

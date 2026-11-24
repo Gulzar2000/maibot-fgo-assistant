@@ -1,7 +1,7 @@
 """用模拟的官方响应验证同一会话里的预检和购买。"""
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 import hashlib
 import json
@@ -13,13 +13,28 @@ from gacha.saplings import SaplingClient
 
 
 class SaplingExchangeTests(unittest.TestCase):
+    def test_bili_requests_use_the_observed_game_hosts_and_unity_headers(self):
+        for server, host in (
+            ("android", "le1-bili-fate.bilibiligame.net"),
+            ("ios", "le1-ios-fate.bilibiligame.net"),
+        ):
+            with self.subTest(server=server):
+                client = SaplingClient(SimpleNamespace(), server)
+                with patch.object(client._opener, "open") as open_request:
+                    open_request.return_value.__enter__.return_value.read.return_value = b"{}"
+                    client._request(client.game_url + "/login.php", {})
+                request = open_request.call_args.args[0]
+                self.assertEqual(urlsplit(request.full_url).hostname, host)
+                self.assertEqual(request.get_header("User-agent"), "UnityPlayer/2022.3.62f2")
+                self.assertEqual(request.get_header("X-unity-version"), "2022.3.62f2")
+
     def run_exchange(self, requested, *, ap=95, saplings=8, timeout=False, server="android", server_time=1700000000,
-                     maintenance_at=None, recovery_elapsed=0):
+                     maintenance_at=None, recovery_elapsed=0, other_fruits=()):
         profile = SimpleNamespace(version="test", development_code="test", session_prefix="prefix")
         client = SaplingClient(profile, server)
         host, channel, platform = {
-            "android": ("line3-s2-bili-fate.bilibiligame.net", "24", "3"),
-            "ios": ("line3-s2-ios-fate.bilibiligame.net", "996", "2"),
+            "android": ("le1-bili-fate.bilibiligame.net", "24", "3"),
+            "ios": ("le1-ios-fate.bilibiligame.net", "996", "2"),
             "uo": ("line3-s1-uo-fate.bilibiligame.net", "24", "3"),
         }[server]
         calls = []
@@ -36,7 +51,7 @@ class SaplingExchangeTests(unittest.TestCase):
                 return b'{"response":[{"nid":"","resCode":"88","fail":{"action":"maintain"}}]}'
             self.assertEqual(urlsplit(url).hostname, host)
             self.assertEqual(params["rkchannel"], channel)
-            if key in ("home", "shoppurchase"):
+            if server == "ios" or key in ("home", "shoppurchase"):
                 self.assertEqual(params["cPlat"], "3")
                 self.assertEqual(params["uPlat"], platform)
             if url.endswith("logintomembercenter.php"):
@@ -47,12 +62,14 @@ class SaplingExchangeTests(unittest.TestCase):
                 root = {"response": [response("login", {}, usk="top-token")], "cache": {
                     "serverTime": server_time, "replaced": {
                         "userGame": [dict(userId="42", actMax=147, actRecoverAt=server_time + (147 - ap) * 300 - recovery_elapsed,
-                                          carryOverActPoint=0)],
-                        "userItem": [dict(itemId="103", num=saplings), dict(itemId="104", num=5)],
+                                          carryOverActPoint=0, stone=100)],
+                        "userItem": [dict(itemId="103", num=saplings), dict(itemId="104", num=5)]
+                                    + [dict(itemId=item, num=num) for item, num in other_fruits],
                     },
                 }}
             elif key == "home":
-                sleep.assert_called_once_with(2)
+                delay.assert_called_once_with(4, 6)
+                sleep.assert_called_once_with(5.25)
                 root = {"response": [response("other", {}, usk="home-token"), response("home", {})],
                         "cache": {"serverTime": server_time, "updated": {"userGame": [dict(userId="42")]}}}
             else:
@@ -75,17 +92,36 @@ class SaplingExchangeTests(unittest.TestCase):
                 }}
             return json.dumps(root).encode()
 
-        with patch("gacha.saplings.time.sleep") as sleep, patch.object(client, "_request", side_effect=request):
+        observe = MagicMock()
+        with (
+            patch("gacha.saplings.time.sleep") as sleep,
+            patch("gacha.saplings.uniform", return_value=5.25) as delay,
+            patch.object(client, "_request", side_effect=request),
+        ):
             try:
-                return client.exchange(user, requested, lambda: False)
+                return client.exchange(user, requested, lambda: False, on_capture=observe)
             finally:
                 self.assertEqual(user, {})
                 self.assertFalse(client._session)
+                observe.assert_called_once()
+                self.assertEqual(observe.call_args.args[0]["cache"]["serverTime"], server_time)
 
     def test_default_uses_ap_and_inventory_in_one_login(self):
-        self.assertIn("获得 2 个青铜果实", self.run_exchange(None))
+        reply = self.run_exchange(None)
+        self.assertIn("获得 2 个青铜果实", reply)
+        self.assertIn("现有青铜果实：7 个", reply)
+        self.assertIn("剩余 AP 储备：280 AP", reply)
         self.assertEqual([key for key, _ in self.calls], ["token", "login", "toplogin", "home", "shoppurchase"])
         self.assertIn("获得 1 个青铜果实", self.run_exchange(None, saplings=1))
+
+    def test_ap_reserve_uses_all_four_fruits_and_rounds_silver_up(self):
+        fruits = (("100", 2), ("101", "3"), ("102", 4))
+        reply = self.run_exchange(None, other_fruits=fruits)
+        self.assertIn(
+            "剩余 AP 储备：836 AP（黄金果实 2 个、白银果实 3 个、青铜果实 7 个、赤铜果实 4 个）",
+            reply,
+        )
+        self.assertIn("剩余 AP 储备：756 AP", self.run_exchange(None, ap=39, other_fruits=fruits))
 
     def test_ios_and_uo_use_their_bound_server_for_the_entire_exchange(self):
         for server in ("ios", "uo"):

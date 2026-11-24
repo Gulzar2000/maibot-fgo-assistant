@@ -249,6 +249,22 @@ class PlanComparisonTests(unittest.TestCase):
         self.assertEqual(after["comparison"]["consumed"]["11"], 7)
 
 
+    def test_unknown_costumes_are_skipped_without_losing_known_costs(self):
+        data, top = metadata(), root()
+        data["servants"]["1"]["costumeCosts"] = {
+            "100": {"items": [{"itemId": 11, "amount": 4}], "qp": 30},
+            "11": {"items": [{"itemId": 11, "amount": 999}], "qp": 999},
+        }
+        top["cache"]["replaced"]["userSvtCollection"] = [{"svtId": 1, "costumeIds": []}]
+        before = build_plan_report(top, data)
+        top["cache"]["replaced"]["userSvtCollection"][0]["costumeIds"] = [-11, 100, 999]
+        after = build_plan_report(top, data, before["snapshot"])
+        self.assertEqual(after["comparison"]["consumed"]["11"], 4)
+        self.assertEqual(after["comparison"]["consumed"]["1"], 30)
+        self.assertEqual(after["comparison"]["gains"]["11"], 4)
+        self.assertEqual(after["snapshot"]["costumes"]["1"], [-11, 100, 999])
+
+
 class PlanAccountTests(unittest.TestCase):
     def test_repeat_query_without_confirmation_shared_mutex_cancel_and_no_raw_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

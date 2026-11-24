@@ -19,8 +19,8 @@ _SDK = "https://line3-sdk-center-login-sh.biligame.net"
 # 国服分别使用哔哩安卓、iOS 和享游安卓主机。
 # 角色区服与授权所用 SDK 及本工具所在操作系统无关。
 SERVERS = {
-    "android": ("安卓服务器", "https://line3-s2-bili-fate.bilibiligame.net"),
-    "ios": ("iOS 服务器", "https://line3-s2-ios-fate.bilibiligame.net"),
+    "android": ("安卓服务器", "https://le1-bili-fate.bilibiligame.net"),
+    "ios": ("iOS 服务器", "https://le1-ios-fate.bilibiligame.net"),
     "uo": ("享游安卓", "https://line3-s1-uo-fate.bilibiligame.net"),
 }
 _LIMIT = 16 * 1024 * 1024
@@ -38,21 +38,29 @@ class GameClient:
         self.profile = profile
         self.server = server
         self.game_url = SERVERS[server][1]
+        self._account_channel = "996" if server == "ios" else "24"
+        self._account_platform = "2" if server == "ios" else "3"
         # 不继承系统代理；凭据仅通过经过证书校验的官方 TLS 连接发送。
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     def _request(self, url: str, fields: dict) -> bytes:
         if not url.startswith((_SDK + "/", self.game_url + "/")):
             raise ExportError("REMOTE_DESTINATION_REJECTED")
+        unity_version = "2019.4.40f1"
+        if url.startswith(_SDK + "/"):
+            user_agent = "Mozilla/5.0 BSGameSDK"
+        elif self.server in ("android", "ios"):
+            unity_version = "2022.3.62f2"
+            user_agent = f"UnityPlayer/{unity_version}"
+        else:
+            user_agent = "Dalvik/2.1.0 (Linux; U; Android 9)"
         request = urllib.request.Request(
             url,
             urllib.parse.urlencode(fields).encode(),
             headers={
-                "User-Agent": "Mozilla/5.0 BSGameSDK"
-                if url.startswith(_SDK)
-                else "Dalvik/2.1.0 (Linux; U; Android 9)",
+                "User-Agent": user_agent,
                 "Content-Type": "application/x-www-form-urlencoded",
-                "X-Unity-Version": "2019.4.40f1",
+                "X-Unity-Version": unity_version,
             },
         )
         try:
@@ -79,15 +87,16 @@ class GameClient:
             raise ExportError("REMOTE_REQUEST_FAILED") from None
 
     def _sdk(self, action: str, extra: dict | None = None) -> dict:
+        return self.request_sdk("/api/external/qrcode.login/" + action + "/v3", extra)
+
+    def request_sdk(self, path: str, extra: dict | None = None) -> dict:
         params = dict(self.profile.sdk_base, timestamp=str(int(time.time() * 1000)))
         params.update(extra or {})
         params["sign"] = hashlib.md5(
             ("".join(params[k] for k in sorted(params)) + self.profile.sdk_key).encode()
         ).hexdigest()
         try:
-            result = json.loads(
-                self._request(_SDK + "/api/external/qrcode.login/" + action + "/v3", params)
-            )
+            result = json.loads(self._request(_SDK + path, params))
             if not isinstance(result, dict):
                 raise ExportError("SDK_RESPONSE_INVALID")
             return result
@@ -184,7 +193,11 @@ class GameClient:
                 "try": "",
                 "dataVer": "0",
                 "developmentAuthCode": self.profile.development_code,
+                "rkchannel": self._account_channel,
             }
+            # MuMu 的安卓客户端登录 iOS 服时，客户端平台仍为安卓，账号平台为 iOS。
+            if self.server == "ios":
+                common.update(cPlat="3", uPlat=self._account_platform)
 
             def stage(name):
                 if cancelled():
@@ -205,7 +218,6 @@ class GameClient:
                 rkuid=uid,
                 access_token=access,
                 rksdkid="1",
-                rkchannel="24",
                 version="0",
             )
             _, info = self._game("/rongame_beta/rgfate/60_member/logintomembercenter.php", member)
@@ -228,7 +240,6 @@ class GameClient:
                 imei="",
                 type="login",
                 nickname=str(info["rgusk"])[:10],
-                rkchannel="24",
                 assetbundleFolder="",
                 userAgent="1",
                 t="20399",
@@ -249,7 +260,6 @@ class GameClient:
                 ).hexdigest(),
                 umk="",
                 rgsid="1001",
-                rkchannel="24",
                 userAgent="1",
                 lastAccessTime="0",
                 nickname=str(login.get("nickname", "")),

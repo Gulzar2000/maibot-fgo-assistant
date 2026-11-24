@@ -1,10 +1,18 @@
 [plugin]
 enabled = true
-config_version = "1.0.5"
+config_version = "1.0.7"
 
 [tree]
-# 北京时间，24小时制 HH:MM；可预约到该时刻（含），仅限当天未来时间。
+# 北京时间，24小时制 HH:MM；当天预约最晚可到该时刻，自动种树末班提前 10 分钟。
 latest_time = "22:00"
+# 可查询种树登记及手动发送公告日报的管理员 QQ 号，以字符串填写。
+admin_qqs = []
+
+[announcements]
+# 自动发送官方公告日报的 QQ 群号，以字符串填写。留空关闭群发。
+group_ids = []
+# 北京时间，24 小时制 HH:MM。
+daily_time = "09:30"
 
 [gacha]
 display_mode = "image"
