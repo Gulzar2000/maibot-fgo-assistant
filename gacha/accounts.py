@@ -21,8 +21,9 @@ from .binding_transfer import open_binding
 from .capture_import import game_history_key, merge_points, migrate_game_history
 from .pool_manager import normalize_qq_user_id
 from .image_gen import _find_font
-from .real_statistics import build_real_statistics, count, table
+from .real_statistics import CaptureRate, build_real_statistics, count, table
 from .rate_chart import CaptureReport, history_points, render_rate_chart
+from .statistics import validate_draw_statistics
 from .bond import BondStore, build_bond_report
 from .bond_image import render_bond_report
 from .box import BoxCard, build_box_cards, load_box_index, owned_servants
@@ -303,14 +304,46 @@ class AccountStore:
     def load(self, user_id: str) -> Optional[dict]:
         with self._lock:
             self._import_locked(user_id)
-            path = self.path(user_id)
-            if not path.exists():
-                return None
-            value = json.loads(protect(path.read_bytes(), True))
+            return self._load_locked(user_id)
+
+    def _load_locked(self, user_id: str) -> Optional[dict]:
+        path = self.path(user_id)
+        if not path.exists():
+            return None
+        value = json.loads(protect(path.read_bytes(), True))
         if value["qq"] != normalize_qq_user_id(user_id) or value["server"] not in SERVERS:
             raise ExportError("LOCAL_CREDENTIAL_INVALID")
         validate_credentials(value["user"])
         return value
+
+    def latest_rates(self, user_ids: List[str]) -> Dict[str, CaptureRate]:
+        """按当前绑定读取已有出率。排行榜不会导入凭据或发起游戏登录。"""
+        rates: Dict[str, CaptureRate] = {}
+        with self._lock:
+            history = self._capture_history()
+            if not history:
+                return rates
+            for user_id in user_ids:
+                try:
+                    saved = self._load_locked(user_id)
+                    if saved is None:
+                        continue
+                    try:
+                        binding = history.get(self._capture_key(saved["server"], saved["user"]), {})
+                    finally:
+                        saved["user"].clear()
+                    game_key = binding.get("fgo_history_key")
+                    points = history_points(history[game_key] if game_key else binding)
+                    if not points:
+                        continue
+                    snapshot = points[-1]
+                    total_draws, ssr_count = snapshot["total_draws"], snapshot["ssr_count"]
+                    validate_draw_statistics(total_draws, ssr_count)
+                    if total_draws:
+                        rates[user_id] = CaptureRate(total_draws, ssr_count, snapshot.get("estimated", False))
+                except (ExportError, KeyError, OSError, TypeError, ValueError) as error:
+                    logger.warning("FGO 排行榜跳过无效绑定或出率记录：%s", type(error).__name__)
+        return rates
 
     def _import_locked(self, user_id: str) -> None:
         """管理员手动放入后，下一次 stat 按 QQ 自动导入；不接收聊天附件。"""

@@ -32,6 +32,7 @@ from .gacha.downloader import build_card_name_map
 from .gacha.statistics import format_draw_statistics
 from .gacha.accounts import AccountStore, qr_image
 from .gacha.rate_chart import CaptureReport
+from .gacha.ranking import build_ranking, fetch_avatars, render_ranking
 from .gacha.account_protocol.errors import ExportError
 from .gacha.credentials import atomic_write, json_bytes, validate_credentials
 from .gacha.announcements import AnnouncementService
@@ -184,6 +185,7 @@ class FgoGachaPlugin(MaiBotPlugin):
         self._update_task: Optional[asyncio.Task] = None
         self._download_task: Optional[asyncio.Task] = None
         self._pool_refresh_lock = asyncio.Lock()
+        self._ranking_locks: Dict[str, asyncio.Lock] = {}
         self._account_jobs: Dict[str, asyncio.Task] = {}
         self._account_cancels: Dict[str, Event] = {}
         self._account_unbinding: Set[str] = set()
@@ -447,6 +449,7 @@ class FgoGachaPlugin(MaiBotPlugin):
             "/fgo pools — 查看国服当前及未来卡池\n"
             "/fgo switch <卡池编号> [子池编号] — 切换模拟卡池\n"
             "/fgo stat — 查看累计模拟出率与评级\n"
+            "/fgo rank — 查看本群真实出率前五\n"
             "\n"
             "模拟抽卡有每日额度和冷却，按QQ独立计算。\n"
             "单五星UP池支持330抽保底，切换卡池会重置保底进度。\n"
@@ -480,7 +483,7 @@ class FgoGachaPlugin(MaiBotPlugin):
             "【中文别名】\n"
             "保留 /fgo 前缀，参数用法与原指令相同：\n"
             "帮助=help，卡池=pools，切换卡池=switch\n"
-            "模拟出率=stat，真实出率/抓包=stat real\n"
+            "模拟出率=stat，真实出率/抓包=stat real，排行榜=rank\n"
             "绑定=bind，解绑=unbind，种树=tree，活动=events，素材=material"
         )
         if stream_id:
@@ -648,6 +651,57 @@ class FgoGachaPlugin(MaiBotPlugin):
         if not pages:
             pages = ["近期没有符合条件的当前、即将开启或即将结束的官方活动。"]
         await self._send_announcement_pages(stream_id, pages)
+        return True, "", True
+
+    # === /fgo rank — 群出率排行 ===
+
+    @Command(
+        name="fgo_rank",
+        description="查看当前 QQ 群最近保存的真实出率前五",
+        pattern=r"^/fgo\s+(?:rank|排行榜)\s*$",
+    )
+    async def cmd_rank(
+        self, stream_id: str = "", group_id: str = "", platform: str = "", **kwargs,
+    ) -> tuple[bool, str, bool]:
+        if platform != "qq" or not group_id or not stream_id:
+            return True, "出率排行榜仅支持 QQ 群聊。", True
+        try:
+            group_id = normalize_qq_user_id(group_id)
+        except ValueError:
+            return True, "无法读取有效的 QQ 群号。", True
+
+        path = Path(self.ctx.paths.data_dir) / "fgogacha" / "rankings" / f"{group_id}.json"
+        async with self._ranking_locks.setdefault(group_id, asyncio.Lock()):
+            try:
+                members = await self.ctx.api.call(
+                    "adapter.napcat.group.get_group_member_list", version="1", group_id=group_id, no_cache=True,
+                )
+                if not members:
+                    raise RuntimeError("NapCat 未返回群成员")
+                nicknames = {
+                    normalize_qq_user_id(member["user_id"]): (
+                        (member.get("card") or "").strip() or (member.get("nickname") or "").strip()
+                    )
+                    for member in members
+                }
+                rates = await asyncio.to_thread(self.accounts.latest_rates, list(nicknames))
+                try:
+                    previous = json.loads(await asyncio.to_thread(path.read_bytes))
+                except FileNotFoundError:
+                    previous = []
+                rows = build_ranking(rates, nicknames, previous)
+                avatars = await fetch_avatars(rows)
+                image = await asyncio.to_thread(render_ranking, rows, avatars, self.res_dir)
+                if not await self.ctx.send.image(image, stream_id):
+                    raise RuntimeError("排行榜图片发送失败")
+            except Exception:
+                logger.exception("FGO 出率排行榜生成或发送失败")
+                return True, "出率排行榜查询失败，请查看插件日志。", True
+
+            try:
+                await asyncio.to_thread(atomic_write, path, json_bytes([row.user_id for row in rows]))
+            except OSError:
+                logger.exception("FGO 排行榜名次快照保存失败")
         return True, "", True
 
     # === /fgo stat — 个人累计出率 ===
